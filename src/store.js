@@ -1,65 +1,93 @@
 // src/store.js
+// Mongo-backed data store for orders & messages
+
 const { MongoClient } = require('mongodb');
 
-const uri = process.env.MONGODB_URI;
-if (!uri) {
-  throw new Error('MONGODB_URI is not defined in environment variables');
-}
+const {
+  MONGODB_URI,
+  DB_NAME = 'covermeup',
+} = process.env;
 
-let db, orders, messages;
+let client;
+let db;
+let ordersCol;
+let messagesCol;
 
+// Connect once on boot
 async function init() {
-  const client = new MongoClient(uri);
+  if (db) return db;
+  if (!MONGODB_URI) {
+    console.warn('⚠️  MONGODB_URI not set; store will remain disabled.');
+    return null;
+  }
+  client = new MongoClient(MONGODB_URI, {
+    // sensible defaults for Atlas
+    maxPoolSize: 10,
+    serverSelectionTimeoutMS: 15000,
+  });
   await client.connect();
+  db = client.db(DB_NAME);
+  ordersCol = db.collection('orders');
+  messagesCol = db.collection('messages');
 
-  // Use DB from URI if provided, otherwise fallback to DB_NAME env
-  const dbName = process.env.DB_NAME || uri.split('/').pop().split('?')[0] || 'covermeup';
-  db = client.db(dbName);
+  // Helpful indexes
+  await Promise.all([
+    ordersCol.createIndex({ phone: 1, createdAt: -1 }),
+    ordersCol.createIndex({ orderId: 1 }, { unique: false }),
+    messagesCol.createIndex({ from: 1, createdAt: -1 }),
+  ]);
 
-  // Ensure collections
-  orders = db.collection('orders');
-  messages = db.collection('messages');
-
-  console.log(`✅ Connected to MongoDB database: ${dbName}`);
+  console.log(`✅ Connected to MongoDB database: ${DB_NAME}`);
+  return db;
 }
 
-init().catch(err => {
-  console.error('❌ MongoDB connection failed:', err);
-  process.exit(1);
-});
-
-// ---------- ORDERS ----------
-async function addOrder(order) {
-  order.createdAt = new Date();
-  await orders.insertOne(order);
+// Utility to ensure connection for every public method
+async function ready() {
+  if (!db) {
+    try { await init(); } catch (e) {
+      console.error('❌ MongoDB connection failed:', e);
+      return null;
+    }
+  }
+  return db;
 }
 
-async function getOrders(limit = 50) {
-  return orders.find().sort({ createdAt: -1 }).limit(limit).toArray();
-}
+// ------- Public API -------
 
-async function updateLatestOrderByPhone(phone, update) {
-  return orders.findOneAndUpdate(
+exports.addOrder = async function addOrder(order) {
+  if (!await ready()) return;
+  const now = new Date();
+  const doc = {
+    ...order,
+    createdAt: order.createdAt ? new Date(order.createdAt) : now,
+    updatedAt: now,
+  };
+  await ordersCol.insertOne(doc);
+};
+
+exports.updateLatestOrderByPhone = async function updateLatestOrderByPhone(phone, patch) {
+  if (!await ready()) return;
+  await ordersCol.findOneAndUpdate(
     { phone },
-    { $set: { ...update, updatedAt: new Date() } },
+    { $set: { ...patch, updatedAt: new Date() } },
     { sort: { createdAt: -1 } }
   );
-}
+};
 
-// ---------- MESSAGES ----------
-async function addMessage(msg) {
-  msg.createdAt = new Date();
-  await messages.insertOne(msg);
-}
+exports.addMessage = async function addMessage(msg) {
+  if (!await ready()) return;
+  await messagesCol.insertOne({
+    ...msg,
+    createdAt: new Date(),
+  });
+};
 
-async function getMessages(limit = 50) {
-  return messages.find().sort({ createdAt: -1 }).limit(limit).toArray();
-}
+exports.getRecentOrders = async function getRecentOrders(limit = 50) {
+  if (!await ready()) return [];
+  return ordersCol.find({}, { limit }).sort({ createdAt: -1 }).toArray();
+};
 
-module.exports = {
-  addOrder,
-  getOrders,
-  updateLatestOrderByPhone,
-  addMessage,
-  getMessages
+exports.getRecentMessages = async function getRecentMessages(limit = 50) {
+  if (!await ready()) return [];
+  return messagesCol.find({}, { limit }).sort({ createdAt: -1 }).toArray();
 };
