@@ -1,14 +1,11 @@
-// src/server.js
-// WhatsApp + Shopify notifier with Mongo-backed dashboard
-
-// Safe optional dotenv (works locally; no crash in Render)
-try { require('dotenv').config(); } catch {}
+// Safe optional dotenv load (works locally, won't crash on Render)
+try { require('dotenv').config(); } catch (e) {}
 
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const bodyParser = require('body-parser');
-const store = require('./store');
+const store = require('./store'); // must export addOrder/addMessage/updateLatestOrderByPhone and getDb()
 
 const app = express();
 
@@ -25,41 +22,137 @@ const {
   WHATSAPP_VERIFY_TOKEN,
   BRAND_NAME = 'CoverMeUp',
   DEFAULT_COUNTRY_CODE = '91',
+
+  // Broadcast
+  BROADCAST_KEY,
+  OFFER_TEMPLATE = 'offer_new_arrivals_v1',
+  OFFER_TEXT = 'Flat 20% off. Shop now: https://covermeup.in/new'
 } = process.env;
 
-app.use('/webhooks/shopify', bodyParser.raw({ type: 'application/json' }));
-app.get('/health', (req, res) => res.json({ ok: true, version: 'v5.7.2' }));
+// --- Parsers -----------------------------------------------------------------
+app.use('/webhooks/shopify', bodyParser.raw({ type: 'application/json' })); // HMAC requires raw body
 app.use(bodyParser.json());
 
-// ---------- WhatsApp verification ----------
+// --- Health ------------------------------------------------------------------
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// --- WhatsApp Webhook Verification ------------------------------------------
 app.get('/webhooks/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.status(403).send('Forbidden');
 });
 
-// ---------- Incoming WhatsApp messages ----------
+// --- Helpers -----------------------------------------------------------------
+function verifyShopifyHmac(req) {
+  const header = req.get('X-Shopify-Hmac-Sha256') || '';
+  const digest = crypto
+    .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET || '')
+    .update(req.body)
+    .digest('base64');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(header));
+  } catch {
+    return false;
+  }
+}
+
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/\D/g, '');
+  if (d.length === 10) return `${DEFAULT_COUNTRY_CODE}${d}`;            // e.g., 98765... -> 91 + 10d
+  if (d.startsWith('0') && d.length === 11) return `${DEFAULT_COUNTRY_CODE}${d.slice(1)}`;
+  return d; // already has country code
+}
+
+async function sendTemplateWithFallback({ to, template, parameters }) {
+  const langs = Array.from(new Set([WA_TEMPLATE_LANG, 'en_US', 'en'].filter(Boolean)));
+  let lastErr = null;
+
+  for (const lang of langs) {
+    try {
+      const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_ID}/messages`;
+      const payload = {
+        messaging_product: 'whatsapp',
+        to,
+        type: 'template',
+        template: {
+          name: template,
+          language: { code: lang }
+        }
+      };
+      if (parameters?.length) {
+        payload.template.components = [{ type: 'body', parameters }];
+      }
+      console.log('[WA SEND Template]', { template, lang, to });
+      await axios.post(url, payload, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
+      return;
+    } catch (e) {
+      const data = e?.response?.data;
+      const details = data?.error?.error_data?.details || '';
+      const code = data?.error?.code;
+      console.error('[WA SEND ERROR]', { langTried: lang, code, details });
+      // Try next language if template-language mismatch
+      if (code === 132001 && /does not exist/i.test(details || '')) {
+        lastErr = e;
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('All language attempts failed');
+}
+
+// Very light STOP/UNSUBSCRIBE detector
+function isOptOutText(txt = '') {
+  const t = String(txt).trim().toLowerCase();
+  return /^(stop|unsubscribe|opt\s?out|cancel)$/i.test(t);
+}
+
+// YES / NO detector used for order confirmation threads
+function isYesText(txt = '') {
+  return /^(yes|y|confirm|ok|okay|confirmed)$/i.test(String(txt).trim());
+}
+function isNoText(txt = '') {
+  return /^(no|n|cancel|reject|stop)$/i.test(String(txt).trim());
+}
+
+// --- WhatsApp Inbound --------------------------------------------------------
 app.post('/webhooks/whatsapp', async (req, res) => {
   try {
     const messages = req.body?.entry?.[0]?.changes?.[0]?.value?.messages || [];
+    const db = store.getDb && store.getDb();
+    const unsubCol = db && db.collection('unsubscribes');
+
     for (const m of messages) {
       const from = m.from;
       let body = '';
       if (m.text?.body) body = m.text.body.trim();
       if (m.button?.text) body = m.button.text.trim();
 
+      // Save raw inbound
       await store.addMessage({ from, body, type: m.type, id: m.id });
 
-      const yes = /^(yes|y|confirm|ok|okay|confirmed)$/i.test(body);
-      const no  = /^(no|n|cancel|reject|stop)$/i.test(body);
+      // Capture STOP / UNSUBSCRIBE into dedicated collection
+      if (isOptOutText(body) && unsubCol) {
+        await unsubCol.updateOne(
+          { phone: from },
+          { $set: { phone: from, at: new Date(), source: 'inbound' } },
+          { upsert: true }
+        );
+      }
 
-      if (yes) await store.updateLatestOrderByPhone(from, { status: 'confirmed', lastReply: body });
-      else if (no) await store.updateLatestOrderByPhone(from, { status: 'rejected', lastReply: body });
-      else await store.updateLatestOrderByPhone(from, { lastReply: body });
+      // Update last reply on most recent order thread
+      if (isYesText(body)) {
+        await store.updateLatestOrderByPhone(from, { status: 'confirmed', lastReply: body });
+      } else if (isNoText(body)) {
+        await store.updateLatestOrderByPhone(from, { status: 'rejected', lastReply: body });
+      } else {
+        await store.updateLatestOrderByPhone(from, { lastReply: body });
+      }
     }
     res.send('ok');
   } catch (e) {
@@ -68,77 +161,31 @@ app.post('/webhooks/whatsapp', async (req, res) => {
   }
 });
 
-// ---------- Shopify HMAC verify ----------
-function verifyShopifyHmac(req) {
-  const h = req.get('X-Shopify-Hmac-Sha256') || '';
-  const d = crypto.createHmac('sha256', SHOPIFY_WEBHOOK_SECRET || '')
-    .update(req.body)
-    .digest('base64');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(d), Buffer.from(h));
-  } catch {
-    return false;
-  }
-}
-
-// ---------- Phone normalizer ----------
-function normalizePhone(raw) {
-  if (!raw) return null;
-  const d = String(raw).replace(/\D/g, '');
-  if (d.length === 10) return `${DEFAULT_COUNTRY_CODE}${d}`;
-  if (d.startsWith('0') && d.length === 11) return `${DEFAULT_COUNTRY_CODE}${d.slice(1)}`;
-  return d;
-}
-
-// ---------- WhatsApp template sender with language fallback ----------
-async function sendTemplateWithFallback({ to, template, parameters }) {
-  const langs = Array.from(new Set([WA_TEMPLATE_LANG, 'en_US', 'en'].filter(Boolean)));
-  let lastErr = null;
-  for (const lang of langs) {
-    try {
-      const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_ID}/messages`;
-      const payload = {
-        messaging_product: 'whatsapp',
-        to,
-        type: 'template',
-        template: { name: template, language: { code: lang } },
-      };
-      if (parameters?.length) {
-        payload.template.components = [{ type: 'body', parameters }];
-      }
-      console.log('[WA SEND Template]', { template, lang, to });
-      await axios.post(url, payload, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
-      if (lang !== WA_TEMPLATE_LANG) console.log(`[WA RETRY] Succeeded with fallback language: ${lang}`);
-      return;
-    } catch (e) {
-      const data = e?.response?.data;
-      const details = data?.error?.error_data?.details || '';
-      const code = data?.error?.code;
-      console.error('[WA SEND ERROR]', { langTried: lang, code, details: details || data || e.message });
-      if (code === 132001 && /translation/i.test(details || '')) {
-        lastErr = e; continue;
-      } else {
-        throw e;
-      }
-    }
-  }
-  throw lastErr || new Error('All language attempts failed');
-}
-
-// ---------- Shopify: Orders Create -> send confirmation ----------
+// --- Shopify: Orders Create --------------------------------------------------
 app.post('/webhooks/shopify/orders-create', async (req, res) => {
   if (!verifyShopifyHmac(req)) return res.status(401).send('Unauthorized');
 
-  const o = JSON.parse(req.body.toString('utf8'));
-  const to = normalizePhone(o.phone || o.customer?.phone || o.shipping_address?.phone);
+  const order = JSON.parse(req.body.toString('utf8'));
+  const to = normalizePhone(order.phone || order.customer?.phone || order.shipping_address?.phone);
   if (!to) return res.send('No phone');
 
-  const name = o?.shipping_address?.name || o?.customer?.first_name || 'there';
-  const orderId = o.name || String(o.id);
-  const total = `₹${(Number(o.total_price) || 0).toFixed(2)}`;
-  const items = (o.line_items || []).map(li => `${li.title} x${li.quantity}`).join(', ').slice(0, 900);
+  const name = order?.shipping_address?.name || order?.customer?.first_name || 'there';
+  const orderId = order.name || String(order.id);
+  const total = `₹${(Number(order.total_price) || 0).toFixed(2)}`;
+  const items = (order.line_items || [])
+    .map(li => `${li.title} x${li.quantity}`)
+    .join(', ')
+    .slice(0, 900);
 
-  await store.addOrder({ id: o.id, orderId, phone: to, name, total, items, status: 'pending' });
+  await store.addOrder({
+    id: order.id,
+    orderId,
+    phone: to,
+    name,
+    total,
+    items,
+    status: 'pending'
+  });
 
   try {
     await sendTemplateWithFallback({
@@ -149,8 +196,8 @@ app.post('/webhooks/shopify/orders-create', async (req, res) => {
         { type: 'text', text: orderId },
         { type: 'text', text: BRAND_NAME },
         { type: 'text', text: total },
-        { type: 'text', text: items },
-      ],
+        { type: 'text', text: items }
+      ]
     });
   } catch (e) {
     console.error('[WA SEND FALLBACK] Failed:', e?.response?.data || e.message);
@@ -159,7 +206,7 @@ app.post('/webhooks/shopify/orders-create', async (req, res) => {
   res.send('ok');
 });
 
-// ---------- Shopify: Fulfillment Create -> shipped update ----------
+// --- Shopify: Fulfillment Create --------------------------------------------
 app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
   if (!verifyShopifyHmac(req)) return res.status(401).send('Unauthorized');
 
@@ -177,8 +224,8 @@ app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
       parameters: [
         { type: 'text', text: name },
         { type: 'text', text: orderId },
-        { type: 'text', text: BRAND_NAME },
-      ],
+        { type: 'text', text: BRAND_NAME }
+      ]
     });
   } catch (e) {
     console.error('[WA SEND FAIL]', e?.response?.data || e.message);
@@ -187,96 +234,104 @@ app.post('/webhooks/shopify/fulfillments-create', async (req, res) => {
   res.send('ok');
 });
 
-// ---------- Simple HTML dashboard (Mongo-backed) ----------
-function esc(s = '') {
-  return String(s)
-    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
-}
-
-app.get('/dashboard', async (_req, res) => {
+// --- Admin Broadcast (Marketing) --------------------------------------------
+// GET /admin/broadcast?key=...&dry=1&limit=20&template=...&text=...
+app.get('/admin/broadcast', async (req, res) => {
   try {
-    const [orders, messages] = await Promise.all([
-      store.getRecentOrders(50),
-      store.getRecentMessages(50),
-    ]);
+    if (!BROADCAST_KEY || req.query.key !== BROADCAST_KEY) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
 
-    const ordersRows = orders.map(o => `
-      <tr>
-        <td>${esc(o.createdAt?.toISOString?.() || '')}</td>
-        <td>${esc(o.orderId || '')}</td>
-        <td>${esc(o.name || '')}</td>
-        <td>${esc(o.phone || '')}</td>
-        <td>${esc(o.total || '')}</td>
-        <td class="items" title="${esc(o.items || '')}">${esc((o.items || '').slice(0, 120))}</td>
-        <td>${esc(o.status || '')}</td>
-        <td>${esc(o.lastReply || '')}</td>
-      </tr>`).join('');
+    const db = store.getDb && store.getDb();
+    if (!db) return res.status(500).json({ ok: false, error: 'DB not ready' });
 
-    const msgRows = messages.map(m => `
-      <tr>
-        <td>${esc(m.createdAt?.toISOString?.() || '')}</td>
-        <td>${esc(m.from || '')}</td>
-        <td>${esc(m.type || '')}</td>
-        <td>${esc(m.body || '')}</td>
-      </tr>`).join('');
+    const Orders = db.collection('orders');
+    const Messages = db.collection('messages');
+    const Unsubs = db.collection('unsubscribes');
 
-    res.set('Content-Type', 'text/html').send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>CoverMeUp WhatsApp Dashboard</title>
-  <style>
-    body{font:14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px;}
-    h1{margin:0 0 8px;font-size:24px}
-    small{opacity:.6}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
-    table{width:100%;border-collapse:collapse}
-    th,td{border:1px solid #ddd;padding:8px;vertical-align:top}
-    th{background:#f8f8f8;text-align:left;position:sticky;top:0}
-    .items{max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef;color:#334}
-    .muted{color:#666}
-  </style>
-</head>
-<body>
-  <h1>CoverMeUp WhatsApp Dashboard <span class="pill">public</span></h1>
-  <div class="muted">Updated: ${esc(new Date().toISOString())}</div>
+    // 1) Build candidate audience from orders collection (unique phones)
+    const docs = await Orders
+      .find({}, { projection: { phone: 1, name: 1 } })
+      .toArray();
 
-  <div class="grid" style="margin-top:20px">
-    <section>
-      <h2>Recent orders (max 50)</h2>
-      <div style="max-height:60vh;overflow:auto;border:1px solid #eee">
-      <table>
-        <thead>
-          <tr>
-            <th>Created</th><th>Order</th><th>Name</th><th>Phone</th>
-            <th>Total</th><th>Items</th><th>Status</th><th>Last reply</th>
-          </tr>
-        </thead>
-        <tbody>${ordersRows || ''}</tbody>
-      </table>
-      </div>
-    </section>
+    const byPhone = new Map();
+    for (const d of docs) {
+      const phone = normalizePhone(d.phone);
+      if (!phone) continue;
+      if (!byPhone.has(phone)) byPhone.set(phone, { phone, name: d.name || 'there' });
+    }
 
-    <section>
-      <h2>Recent messages (max 50)</h2>
-      <div style="max-height:60vh;overflow:auto;border:1px solid #eee">
-      <table>
-        <thead>
-          <tr><th>Created</th><th>From</th><th>Type</th><th>Body</th></tr>
-        </thead>
-        <tbody>${msgRows || ''}</tbody>
-      </table>
-      </div>
-    </section>
-  </div>
-</body>
-</html>`);
+    // 2) Exclude people who opted out (unsub collection)
+    const unsubPhones = new Set(
+      (await Unsubs.find({}, { projection: { phone: 1 } }).toArray()).map(u => u.phone)
+    );
+
+    // 3) Exclude people whose latest message matches opt-out tokens
+    const latestByPhone = await Messages
+      .aggregate([
+        { $sort: { createdAt: -1 } },
+        { $group: { _id: '$from', last: { $first: '$$ROOT' } } }
+      ])
+      .toArray();
+
+    for (const g of latestByPhone) {
+      const p = g._id;
+      const body = g.last?.body || '';
+      if (isOptOutText(body)) unsubPhones.add(p);
+    }
+
+    // Final audience
+    let audience = Array.from(byPhone.values()).filter(x => !unsubPhones.has(x.phone));
+
+    // Limit
+    const limit = Math.max(0, Number(req.query.limit || 0));
+    if (limit > 0) audience = audience.slice(0, limit);
+
+    // Template / text overrides
+    const template = (req.query.template || OFFER_TEMPLATE || '').trim();
+    const offerText = (req.query.text || OFFER_TEXT || '').trim();
+    if (!template) return res.status(400).json({ ok: false, error: 'Missing template' });
+    if (!offerText) return res.status(400).json({ ok: false, error: 'Missing text' });
+
+    // Dry-run?
+    const dry = String(req.query.dry || '0') === '1';
+
+    if (dry) {
+      return res.json({
+        ok: true,
+        dry: true,
+        template,
+        offerText,
+        count: audience.length,
+        sample: audience.slice(0, 10) // show first 10 preview
+      });
+    }
+
+    // 4) Send
+    let sent = 0, failed = 0;
+    const errors = [];
+
+    for (const person of audience) {
+      const params = [
+        { type: 'text', text: person.name || 'there' }, // {{1}}
+        { type: 'text', text: offerText }               // {{2}}
+      ];
+
+      try {
+        await sendTemplateWithFallback({ to: person.phone, template, parameters: params });
+        sent++;
+      } catch (e) {
+        failed++;
+        errors.push({ phone: person.phone, error: e?.response?.data || e?.message || 'send error' });
+      }
+    }
+
+    res.json({ ok: true, template, offerText, total: audience.length, sent, failed, errors });
   } catch (e) {
-    console.error('Dashboard error:', e);
-    res.status(500).send('Dashboard error');
+    console.error('broadcast error:', e);
+    res.status(500).json({ ok: false, error: e?.message || 'Broadcast failed' });
   }
 });
 
+// --- Start -------------------------------------------------------------------
 app.listen(PORT, () => console.log(`Notifier v5.7.2 listening on :${PORT}`));
