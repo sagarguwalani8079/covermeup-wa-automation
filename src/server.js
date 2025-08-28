@@ -1,6 +1,5 @@
 // Safe optional dotenv load: works locally and won't crash in prod if not installed
 try { require('dotenv').config(); } catch (e) {}
-require('dotenv').config();
 const express = require('express'),
   crypto = require('crypto'),
   axios = require('axios'),
