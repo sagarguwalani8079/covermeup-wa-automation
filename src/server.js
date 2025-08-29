@@ -32,7 +32,7 @@ const {
 
   // Templates (override these in Render if names differ)
   PREPAID_TEMPLATE = 'order_confirmation',
-  COD_TEMPLATE = 'cod_confirm_v2',
+  COD_TEMPLATE = 'cod_confirm_v3',
   FALLBACK_TEMPLATE = 'hello_world',
 
   // Brand & defaults
