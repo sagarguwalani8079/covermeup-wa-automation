@@ -1,68 +1,77 @@
 // src/store.js
-// Mongo-backed store with one-time connection and safe getters.
-
 const { MongoClient } = require('mongodb');
 
 const {
   MONGODB_URI,
-  MONGODB_DB = 'covermeup',
+  DB_NAME = 'covermeup',
 } = process.env;
 
-let client;
-let db;
-let initError = null;
+let client, db, orders, messages;
 
-// Kick off a single connection attempt at module load
-const initPromise = (async () => {
-  if (!MONGODB_URI) throw new Error('MONGODB_URI is not set');
+async function init() {
   client = new MongoClient(MONGODB_URI, {
-    serverSelectionTimeoutMS: 20000,
     retryWrites: true,
+    tls: true,
   });
   await client.connect();
-  db = client.db(MONGODB_DB);
-  console.log(`✅ Connected to MongoDB database: ${MONGODB_DB}`);
-})().catch(err => {
-  initError = err;
-  console.error('❌ MongoDB connection failed:', err);
+  db = client.db(DB_NAME);
+
+  orders = db.collection('orders');
+  messages = db.collection('messages');
+
+  await orders.createIndex({ phone: 1, createdAt: -1 });
+  await orders.createIndex({ orderId: 1 }, { unique: false });
+  await messages.createIndex({ from: 1, createdAt: -1 });
+
+  console.log(`✅ Connected to MongoDB database: ${DB_NAME}`);
+}
+
+const ensure = (fn) => async (...args) => {
+  if (!orders || !messages) throw new Error('DB not ready');
+  return fn(...args);
+};
+
+// --- Orders ---
+
+const addOrder = ensure(async (doc) => {
+  doc.createdAt = new Date();
+  doc.updatedAt = new Date();
+  await orders.insertOne(doc);
 });
 
-async function getDb() {
-  if (db) return db;
-  await initPromise;
-  if (db) return db;
-  if (initError) throw initError;
-  throw new Error('DB not initialized');
-}
+const setOrderStatusById = ensure(async (orderId, patch) => {
+  patch.updatedAt = new Date();
+  await orders.updateOne({ orderId }, { $set: patch });
+});
 
-async function col(name) {
-  const _db = await getDb();
-  return _db.collection(name);
-}
-
-// Public API used by server.js
-async function addOrder(order) {
-  const orders = await col('orders');
-  await orders.insertOne({ ...order, createdAt: new Date() });
-}
-
-async function addMessage(msg) {
-  const messages = await col('messages');
-  await messages.insertOne({ ...msg, createdAt: new Date() });
-}
-
-async function updateLatestOrderByPhone(phone, patch) {
-  const orders = await col('orders');
-  await orders.findOneAndUpdate(
+const updateLatestOrderByPhone = ensure(async (phone, patch) => {
+  patch.updatedAt = new Date();
+  await orders.updateOne(
     { phone },
-    { $set: { ...patch, updatedAt: new Date() } },
+    { $set: patch },
     { sort: { createdAt: -1 } }
   );
-}
+});
+
+const findLatestPendingCODByPhone = ensure(async (phone) => {
+  return orders.findOne(
+    { phone, cod: true, status: 'pending_cod' },
+    { sort: { createdAt: -1 } }
+  );
+});
+
+// --- Messages ---
+
+const addMessage = ensure(async (doc) => {
+  doc.createdAt = new Date();
+  await messages.insertOne(doc);
+});
 
 module.exports = {
-  getDb,
+  init,
   addOrder,
-  addMessage,
+  setOrderStatusById,
   updateLatestOrderByPhone,
+  findLatestPendingCODByPhone,
+  addMessage,
 };
