@@ -31,8 +31,8 @@ const {
   WA_TEMPLATE_LANG = 'en_US',
 
   // Templates (override these in Render if names differ)
-  PREPAID_TEMPLATE = 'order_confirmation_v1',
-  COD_TEMPLATE = 'cod_confirmation_v1',
+  PREPAID_TEMPLATE = 'order_confirmation',
+  COD_TEMPLATE = 'cod_confirm_v2',
   FALLBACK_TEMPLATE = 'hello_world',
 
   // Brand & defaults
