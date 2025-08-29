@@ -1,4 +1,3 @@
-// src/server.js
 // Safe optional dotenv load for local dev
 try { require('dotenv').config(); } catch (_) {}
 
@@ -23,7 +22,10 @@ const {
 
   // Templates
   ORDER_CONFIRMATION_TEMPLATE = 'order_confirmation', // prepaid
-  COD_TEMPLATE = 'cod_confirm_v2',                    // COD (buttons template)
+  COD_TEMPLATE = 'cod_confirm_v3',                     // COD buttons template (new)
+
+  // COD parameter order (comma list of tokens: NAME,ORDER,BRAND,TOTAL,ITEMS)
+  COD_PARAM_ORDER = 'NAME,ORDER,BRAND',
 
   // Defaults
   WA_TEMPLATE_LANG = 'en_US',
@@ -127,7 +129,6 @@ async function waSendWithFallback({ to, template, bodyParams, headerImageUrl }) 
   } catch (e) {
     const data = e?.response?.data;
     console.error(`[WA SEND ERROR - ${template}]`, { error: data || e });
-    // If template/lang not found try a very simple fallback (no params, no header)
     try {
       console.log('[WA SEND]', JSON.stringify({ to, template: FALLBACK_TEMPLATE }, null, 2));
       return await waSend({ to, template: FALLBACK_TEMPLATE });
@@ -152,10 +153,25 @@ function isCOD(order) {
     gateway.includes('cash') ||
     tags.includes('cod') ||
     tags.includes('cash on delivery') ||
-    // many COD apps mark financial_status pending until delivery
     (fin === 'pending' && (gateways || gateway));
 
   return !!hit;
+}
+
+// Build COD params in the exact order requested by COD_PARAM_ORDER
+function buildCodParams({ name, orderId, brand, total, items }) {
+  const map = {
+    NAME: name,
+    ORDER: orderId,
+    BRAND: brand,
+    TOTAL: total,
+    ITEMS: items
+  };
+  return String(COD_PARAM_ORDER)
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(k => map[k] != null)
+    .map(k => map[k]);
 }
 
 // ---------- Shopify: orders create ----------
@@ -175,31 +191,35 @@ app.post('/webhooks/shopify/orders-create', async (req, res) => {
   // Persist (best-effort)
   await store.addOrder({ id: o.id, orderId, phone, name, total, items, status: 'pending' });
 
-  // Choose template + correct param order per template
   const cod = isCOD(o);
   const templateToUse = cod ? COD_TEMPLATE : ORDER_CONFIRMATION_TEMPLATE;
 
   // PREPAID template expects: name, orderId, BRAND, total, items
   const prepaidParams = [name, orderId, BRAND_NAME, total, items];
 
-  // COD template **cod_confirm_v2** expects: name, BRAND, orderId
-  const codParams = [name, BRAND_NAME, orderId];
+  // COD template params built from env order
+  const codParams = buildCodParams({
+    name,
+    orderId,
+    brand: BRAND_NAME,
+    total,
+    items
+  });
 
   try {
     await waSendWithFallback({
       to: phone,
       template: templateToUse,
       bodyParams: cod ? codParams : prepaidParams
-      // (no header image for order confirmations)
     });
-  } catch (e) {
-    // already logged inside waSendWithFallback
+  } catch (_) {
+    // errors already logged
   }
 
   res.send('ok');
 });
 
-// ---------- admin broadcast (unchanged) ----------
+// ---------- admin broadcast ----------
 // GET /admin/broadcast?key=...&template=...&to=...&p1=..&p2=..&img=https://...
 app.get('/admin/broadcast', async (req, res) => {
   try {
