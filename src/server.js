@@ -1,18 +1,16 @@
-// server.js
-// CoverMeUp WhatsApp Notifier — combined COD template version
+// src/server.js
 
-// Safe optional dotenv load (does nothing in prod if not present)
-try { require("dotenv").config(); } catch (_) {}
+// Safe optional dotenv load (works locally; won't crash in prod if not present)
+try { require('dotenv').config(); } catch (e) {}
 
-const express = require("express");
-const crypto = require("crypto");
-const axios = require("axios");
-const bodyParser = require("body-parser");
-const store = require("./store");
+const express = require('express');
+const crypto = require('crypto');
+const axios = require('axios');
+const bodyParser = require('body-parser');
+const store = require('./store');
 
 const app = express();
 
-// ----- ENV -----
 const {
   PORT = 3000,
 
@@ -22,33 +20,39 @@ const {
   // WhatsApp Cloud API
   WA_TOKEN,
   WA_PHONE_ID,
-  WA_GRAPH_VERSION = "v20.0",
-  WA_TEMPLATE_LANG = "en_US",
+  WA_GRAPH_VERSION = 'v20.0',
+  WA_TEMPLATE_LANG = 'en_US', // default to en_US to avoid translation errors
+  WHATSAPP_VERIFY_TOKEN,
 
-  // Template names
-  ORDER_CONFIRMATION_TEMPLATE = "order_confirmation", // prepaid
-  COD_TEMPLATE = "cod_confirm_v3",                    // combined COD template
+  // Templates
+  ORDER_CONFIRMATION_TEMPLATE = 'order_confirmation',          // prepaid flow (5 params)
+  COD_CONFIRM_TEMPLATE = 'cod_confirm_and_summary_v1',         // COD flow (5 params, your new combined template)
+  FALLBACK_TEMPLATE = 'hello_world',
 
-  // Business defaults
-  BRAND_NAME = "CoverMeUp",
-  DEFAULT_COUNTRY_CODE = "91",
-  WHATSAPP_VERIFY_TOKEN
+  // Brand & formatting
+  BRAND_NAME = 'CoverMeUp',
+  DEFAULT_COUNTRY_CODE = '91'
 } = process.env;
 
-// ----- MIDDLEWARE -----
-app.use("/webhooks/shopify", bodyParser.raw({ type: "application/json" }));
-app.get("/health", (_, res) => res.json({ ok: true }));
+/* ------------------------ Express setup ------------------------ */
+
+// Shopify requires the exact raw body for HMAC verification:
+app.use('/webhooks/shopify', bodyParser.raw({ type: 'application/json' }));
+
+// Everything else may use JSON
 app.use(bodyParser.json());
 
-// ----- HELPERS -----
+app.get('/health', (req, res) => res.json({ ok: true, dbReady: !!store.ready }));
 
-// Verify Shopify HMAC header
+/* -------------------- Helpers & utilities --------------------- */
+
 function verifyShopifyHmac(req) {
-  const signature = req.get("X-Shopify-Hmac-Sha256") || "";
+  const signature = req.get('X-Shopify-Hmac-Sha256') || '';
   const digest = crypto
-    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET || "")
-    .update(req.body)
-    .digest("base64");
+    .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET || '')
+    .update(req.body) // NOTE: this is the raw Buffer because of bodyParser.raw above
+    .digest('base64');
+
   try {
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
   } catch {
@@ -56,171 +60,214 @@ function verifyShopifyHmac(req) {
   }
 }
 
-// Normalize phone: add default country if 10-digit Indian number, strip non-digits
 function normalizePhone(raw) {
   if (!raw) return null;
-  const d = String(raw).replace(/\D/g, "");
-  if (d.length === 10) return `${DEFAULT_COUNTRY_CODE}${d}`;
-  if (d.startsWith("0") && d.length === 11) return `${DEFAULT_COUNTRY_CODE}${d.slice(1)}`;
-  return d;
+  const digits = String(raw).replace(/\D/g, '');
+  // India: accept 10-digit and add country code
+  if (digits.length === 10) return `${DEFAULT_COUNTRY_CODE}${digits}`;
+  if (digits.startsWith('0') && digits.length === 11) return `${DEFAULT_COUNTRY_CODE}${digits.slice(1)}`;
+  return digits;
 }
 
-// Generic template sender (optionally with body params & header image)
-async function sendTemplate({ to, template, bodyParams = [], headerImage = null }) {
+/** Determine if an order is COD */
+function isCOD(order) {
+  const gateways = new Set(
+    (order?.payment_gateway_names || [])
+      .concat(order?.gateway ? [order.gateway] : [])
+      .map(s => (s || '').toString().toLowerCase())
+  );
+
+  const hasCODGateway =
+    gateways.has('cod') ||
+    gateways.has('cash on delivery') ||
+    gateways.has('cash_on_delivery');
+
+  // Shopify usually sets financial_status = 'pending' for COD
+  const pending = (order?.financial_status || '').toLowerCase() === 'pending';
+
+  return hasCODGateway || pending;
+}
+
+/** Send a WhatsApp template with language fallback */
+async function sendTemplate({ to, template, components }) {
+  const langs = Array.from(new Set([WA_TEMPLATE_LANG, 'en_US', 'en'].filter(Boolean)));
   const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_ID}/messages`;
+  let lastErr = null;
 
-  const payload = {
-    messaging_product: "whatsapp",
-    to,
-    type: "template",
-    template: {
-      name: template,
-      language: { code: WA_TEMPLATE_LANG }
+  for (const lang of langs) {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: {
+        name: template,
+        language: { code: lang }
+      }
+    };
+
+    if (components && components.length) {
+      payload.template.components = components;
     }
-  };
 
-  const components = [];
+    try {
+      console.log('[WA SEND]', JSON.stringify({ to, template, components }, null, 2));
+      await axios.post(url, payload, {
+        headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' }
+      });
+      return { ok: true };
+    } catch (e) {
+      const err = e?.response?.data || e?.message || e;
+      console.error(`[WA SEND ERROR - ${template}]`, err);
+      lastErr = err;
 
-  if (headerImage) {
-    components.push({
-      type: "header",
-      parameters: [{ type: "image", image: { link: headerImage } }]
-    });
+      // If template name missing for this translation, try next language
+      const code = e?.response?.data?.error?.code;
+      const details = e?.response?.data?.error?.error_data?.details || '';
+      if (code === 132001 && /does not exist/i.test(details)) continue;
+
+      // If parameter mismatch or other fatal error, don't keep looping
+      break;
+    }
   }
 
-  if (bodyParams && bodyParams.length) {
-    components.push({
-      type: "body",
-      parameters: bodyParams.map((t) => ({ type: "text", text: String(t).slice(0, 1024) }))
-    });
+  // attempt 1 tiny fallback template without params if provided
+  if (FALLBACK_TEMPLATE) {
+    try {
+      console.log('[WA SEND]', JSON.stringify({ to, template: FALLBACK_TEMPLATE }, null, 2));
+      await axios.post(
+        url,
+        {
+          messaging_product: 'whatsapp',
+          to,
+          type: 'template',
+          template: { name: FALLBACK_TEMPLATE, language: { code: WA_TEMPLATE_LANG || 'en_US' } }
+        },
+        { headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
+      );
+      return { ok: true, fallback: true };
+    } catch (e) {
+      console.error('[WA SEND FALLBACK ERROR]', e?.response?.data || e?.message || e);
+    }
   }
 
-  if (components.length) payload.template.components = components;
-
-  console.log("[WA SEND]", JSON.stringify({ to, template, components: payload.template.components || [] }, null, 2));
-  await axios.post(url, payload, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` }
-  });
+  return { ok: false, error: lastErr };
 }
 
-// Determine if order is COD
-function isCODOrder(order) {
-  try {
-    // Shopify provides payment gateways as names array; also check payment terms & tags
-    const gateways = (order.payment_gateway_names || []).join(" ").toLowerCase();
-    const terms = (order.payment_terms && order.payment_terms.payment_terms_name || "").toLowerCase();
-    const tags = (order.tags || "").toLowerCase();
+/* -------------------- WhatsApp Webhook (verify) -------------------- */
 
-    if (gateways.includes("cod") || gateways.includes("cash on delivery")) return true;
-    if (terms.includes("cod") || terms.includes("cash on delivery")) return true;
-    if (tags.includes("cod")) return true;
-
-    // Fallback heuristic: unpaid/pending + not a known prepaid gateway
-    const fs = (order.financial_status || "").toLowerCase();
-    if (fs === "pending" && !gateways) return true;
-
-    return false;
-  } catch {
-    return false;
+app.get('/webhooks/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
   }
-}
-
-// Build common order fields
-function extractOrderBasics(o) {
-  const to = normalizePhone(o.phone || o.customer?.phone || o.shipping_address?.phone);
-  const name = o?.shipping_address?.name || o?.customer?.first_name || "there";
-  const orderId = o.name || String(o.id);
-  const total = `₹${(Number(o.total_price) || 0).toFixed(2)}`;
-  const items = (o.line_items || [])
-    .map((li) => `${li.title} x${li.quantity}`)
-    .join(", ")
-    .slice(0, 900);
-
-  return { to, name, orderId, total, items };
-}
-
-// ----- WEBHOOKS -----
-
-// WA Webhook verify
-app.get("/webhooks/whatsapp", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === WHATSAPP_VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.status(403).send("Forbidden");
+  return res.status(403).send('Forbidden');
 });
 
-// WA inbound (optional: save messages)
-app.post("/webhooks/whatsapp", async (req, res) => {
+/* -------------------- WhatsApp Webhook (inbound) ------------------- */
+
+app.post('/webhooks/whatsapp', async (req, res) => {
   try {
     const messages = req.body?.entry?.[0]?.changes?.[0]?.value?.messages || [];
     for (const m of messages) {
       const from = m.from;
-      let body = "";
+      let body = '';
       if (m.text?.body) body = m.text.body.trim();
       if (m.button?.text) body = m.button.text.trim();
+
       await store.addMessage({ from, body, type: m.type, id: m.id });
 
-      // capture simple yes/no for your internal state if you want
       const yes = /^(yes|y|confirm|ok|okay|confirmed)$/i.test(body);
-      const no = /^(no|n|cancel|reject|stop)$/i.test(body);
-      if (yes) await store.updateLatestOrderByPhone(from, { status: "confirmed", lastReply: body });
-      else if (no) await store.updateLatestOrderByPhone(from, { status: "rejected", lastReply: body });
+      const no  = /^(no|n|cancel|reject|stop)$/i.test(body);
+
+      if (yes) await store.updateLatestOrderByPhone(from, { status: 'cod_confirmed', lastReply: body });
+      else if (no) await store.updateLatestOrderByPhone(from, { status: 'cod_rejected',  lastReply: body });
       else await store.updateLatestOrderByPhone(from, { lastReply: body });
     }
-    res.send("ok");
+    res.send('ok');
   } catch (e) {
-    console.error("WA inbound error:", e?.message || e);
-    res.send("err");
+    console.error('WA inbound error:', e?.message || e);
+    res.send('err');
   }
 });
 
-// Shopify: Orders Create
-app.post("/webhooks/shopify/orders-create", async (req, res) => {
-  if (!verifyShopifyHmac(req)) return res.status(401).send("Unauthorized");
+/* -------------------- Shopify: Orders Create ----------------------- */
 
-  const order = JSON.parse(req.body.toString("utf8"));
-  const { to, name, orderId, total, items } = extractOrderBasics(order);
-  if (!to) return res.send("No phone");
+app.post('/webhooks/shopify/orders-create', async (req, res) => {
+  if (!verifyShopifyHmac(req)) return res.status(401).send('Unauthorized');
+  if (!store.ready) return res.status(503).send('DB not ready');
 
-  // Save to DB
+  const o = JSON.parse(req.body.toString('utf8'));
+
+  const to = normalizePhone(o.phone || o.customer?.phone || o.shipping_address?.phone);
+  if (!to) return res.send('No phone');
+
+  const name    = o?.shipping_address?.name || o?.customer?.first_name || 'there';
+  const orderId = o.name || String(o.id);
+  const total   = `₹${(Number(o.total_price) || 0).toFixed(2)}`;
+  const items   = (o.line_items || [])
+    .map(li => `${li.title} x${li.quantity}`)
+    .join(', ')
+    .slice(0, 900);
+
+  // persist order
   await store.addOrder({
-    id: order.id,
+    id: o.id,
     orderId,
     phone: to,
     name,
     total,
     items,
-    status: "pending"
+    status: isCOD(o) ? 'cod_pending' : 'prepaid'
   });
 
-  const cod = isCODOrder(order);
+  // Decide template & parameter order
+  let templateName, components;
 
-  try {
-    if (cod) {
-      // Single combined message: summary + confirm/cancel buttons (defined in template)
-      await sendTemplate({
-        to,
-        template: COD_TEMPLATE,
-        bodyParams: [name, BRAND_NAME, orderId, total, items]
-        // headerImage: <optional image URL if your template uses an IMAGE header>
-      });
-    } else {
-      // Prepaid confirmation (plain summary)
-      await sendTemplate({
-        to,
-        template: ORDER_CONFIRMATION_TEMPLATE,
-        bodyParams: [name, orderId, BRAND_NAME, total, items]
-      });
-    }
-  } catch (e) {
-    console.error(`[WA SEND ERROR - ${cod ? COD_TEMPLATE : ORDER_CONFIRMATION_TEMPLATE}]`, e?.response?.data || e?.message || e);
+  if (isCOD(o)) {
+    // Your new combined COD template: 5 params
+    // 1: Customer name, 2: Brand name, 3: Order ID, 4: Total, 5: Items list
+    templateName = COD_CONFIRM_TEMPLATE;
+    components = [{
+      type: 'body',
+      parameters: [
+        { type: 'text', text: name },
+        { type: 'text', text: BRAND_NAME },
+        { type: 'text', text: orderId },
+        { type: 'text', text: total },
+        { type: 'text', text: items }
+      ]
+    }];
+  } else {
+    // Prepaid: keep your 5-param order_confirmation
+    // 1: Customer name, 2: Order ID, 3: Brand name, 4: Total, 5: Items list
+    templateName = ORDER_CONFIRMATION_TEMPLATE;
+    components = [{
+      type: 'body',
+      parameters: [
+        { type: 'text', text: name },
+        { type: 'text', text: orderId },
+        { type: 'text', text: BRAND_NAME },
+        { type: 'text', text: total },
+        { type: 'text', text: items }
+      ]
+    }];
   }
 
-  res.send("ok");
+  // Fire WhatsApp
+  const result = await sendTemplate({ to, template: templateName, components });
+
+  // Non-blocking: we already stored the order
+  if (!result.ok) {
+    console.error('Failed to send WA template:', result.error);
+  }
+
+  res.send('ok');
 });
 
-// ----- START -----
-app.listen(PORT, () => {
-  console.log(`Notifier (combined COD) listening on :${PORT}`);
-});
+/* ---------------------------- Start ------------------------------- */
+
+app.listen(PORT, () =>
+  console.log(`Notifier (combined COD) listening on :${PORT}`)
+);
