@@ -1,7 +1,5 @@
-// src/server.js
-
-// Safe optional dotenv load (works locally; won't crash in prod if not present)
-try { require('dotenv').config(); } catch (e) {}
+// Safe optional dotenv load for local dev
+try { require('dotenv').config(); } catch (_) {}
 
 const express = require('express');
 const crypto = require('crypto');
@@ -21,152 +19,39 @@ const {
   WA_TOKEN,
   WA_PHONE_ID,
   WA_GRAPH_VERSION = 'v20.0',
-  WA_TEMPLATE_LANG = 'en_US', // default to en_US to avoid translation errors
-  WHATSAPP_VERIFY_TOKEN,
 
   // Templates
-  ORDER_CONFIRMATION_TEMPLATE = 'order_confirmation',          // prepaid flow (5 params)
-  COD_CONFIRM_TEMPLATE = 'cod_confirm_and_summary_v1',         // COD flow (5 params, your new combined template)
-  FALLBACK_TEMPLATE = 'hello_world',
+  ORDER_CONFIRMATION_TEMPLATE = 'order_confirmation', // prepaid
+  COD_TEMPLATE = 'cod_confirm_v3',                     // COD buttons template (new)
 
-  // Brand & formatting
+  // COD parameter order (comma list of tokens: NAME,ORDER,BRAND,TOTAL,ITEMS)
+  COD_PARAM_ORDER = 'NAME,ORDER,BRAND',
+
+  // Defaults
+  WA_TEMPLATE_LANG = 'en_US',
+  FALLBACK_TEMPLATE = 'cmu_fallback_0',
+  WHATSAPP_VERIFY_TOKEN,
   BRAND_NAME = 'CoverMeUp',
   DEFAULT_COUNTRY_CODE = '91'
 } = process.env;
 
-/* ------------------------ Express setup ------------------------ */
-
-// Shopify requires the exact raw body for HMAC verification:
+// parsers
 app.use('/webhooks/shopify', bodyParser.raw({ type: 'application/json' }));
-
-// Everything else may use JSON
 app.use(bodyParser.json());
 
-app.get('/health', (req, res) => res.json({ ok: true, dbReady: !!store.ready }));
+// health
+app.get('/health', (req, res) => res.json({ ok: true }));
 
-/* -------------------- Helpers & utilities --------------------- */
-
-function verifyShopifyHmac(req) {
-  const signature = req.get('X-Shopify-Hmac-Sha256') || '';
-  const digest = crypto
-    .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET || '')
-    .update(req.body) // NOTE: this is the raw Buffer because of bodyParser.raw above
-    .digest('base64');
-
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
-  } catch {
-    return false;
-  }
-}
-
-function normalizePhone(raw) {
-  if (!raw) return null;
-  const digits = String(raw).replace(/\D/g, '');
-  // India: accept 10-digit and add country code
-  if (digits.length === 10) return `${DEFAULT_COUNTRY_CODE}${digits}`;
-  if (digits.startsWith('0') && digits.length === 11) return `${DEFAULT_COUNTRY_CODE}${digits.slice(1)}`;
-  return digits;
-}
-
-/** Determine if an order is COD */
-function isCOD(order) {
-  const gateways = new Set(
-    (order?.payment_gateway_names || [])
-      .concat(order?.gateway ? [order.gateway] : [])
-      .map(s => (s || '').toString().toLowerCase())
-  );
-
-  const hasCODGateway =
-    gateways.has('cod') ||
-    gateways.has('cash on delivery') ||
-    gateways.has('cash_on_delivery');
-
-  // Shopify usually sets financial_status = 'pending' for COD
-  const pending = (order?.financial_status || '').toLowerCase() === 'pending';
-
-  return hasCODGateway || pending;
-}
-
-/** Send a WhatsApp template with language fallback */
-async function sendTemplate({ to, template, components }) {
-  const langs = Array.from(new Set([WA_TEMPLATE_LANG, 'en_US', 'en'].filter(Boolean)));
-  const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_ID}/messages`;
-  let lastErr = null;
-
-  for (const lang of langs) {
-    const payload = {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'template',
-      template: {
-        name: template,
-        language: { code: lang }
-      }
-    };
-
-    if (components && components.length) {
-      payload.template.components = components;
-    }
-
-    try {
-      console.log('[WA SEND]', JSON.stringify({ to, template, components }, null, 2));
-      await axios.post(url, payload, {
-        headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' }
-      });
-      return { ok: true };
-    } catch (e) {
-      const err = e?.response?.data || e?.message || e;
-      console.error(`[WA SEND ERROR - ${template}]`, err);
-      lastErr = err;
-
-      // If template name missing for this translation, try next language
-      const code = e?.response?.data?.error?.code;
-      const details = e?.response?.data?.error?.error_data?.details || '';
-      if (code === 132001 && /does not exist/i.test(details)) continue;
-
-      // If parameter mismatch or other fatal error, don't keep looping
-      break;
-    }
-  }
-
-  // attempt 1 tiny fallback template without params if provided
-  if (FALLBACK_TEMPLATE) {
-    try {
-      console.log('[WA SEND]', JSON.stringify({ to, template: FALLBACK_TEMPLATE }, null, 2));
-      await axios.post(
-        url,
-        {
-          messaging_product: 'whatsapp',
-          to,
-          type: 'template',
-          template: { name: FALLBACK_TEMPLATE, language: { code: WA_TEMPLATE_LANG || 'en_US' } }
-        },
-        { headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
-      );
-      return { ok: true, fallback: true };
-    } catch (e) {
-      console.error('[WA SEND FALLBACK ERROR]', e?.response?.data || e?.message || e);
-    }
-  }
-
-  return { ok: false, error: lastErr };
-}
-
-/* -------------------- WhatsApp Webhook (verify) -------------------- */
-
+// WA verify
 app.get('/webhooks/whatsapp', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === 'subscribe' && token === WHATSAPP_VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.status(403).send('Forbidden');
 });
 
-/* -------------------- WhatsApp Webhook (inbound) ------------------- */
-
+// WA inbound (logs + saves)
 app.post('/webhooks/whatsapp', async (req, res) => {
   try {
     const messages = req.body?.entry?.[0]?.changes?.[0]?.value?.messages || [];
@@ -181,9 +66,9 @@ app.post('/webhooks/whatsapp', async (req, res) => {
       const yes = /^(yes|y|confirm|ok|okay|confirmed)$/i.test(body);
       const no  = /^(no|n|cancel|reject|stop)$/i.test(body);
 
-      if (yes) await store.updateLatestOrderByPhone(from, { status: 'cod_confirmed', lastReply: body });
-      else if (no) await store.updateLatestOrderByPhone(from, { status: 'cod_rejected',  lastReply: body });
-      else await store.updateLatestOrderByPhone(from, { lastReply: body });
+      if (yes)      await store.updateLatestOrderByPhone(from, { status: 'confirmed', lastReply: body });
+      else if (no)  await store.updateLatestOrderByPhone(from, { status: 'rejected',  lastReply: body });
+      else          await store.updateLatestOrderByPhone(from, {                     lastReply: body });
     }
     res.send('ok');
   } catch (e) {
@@ -192,82 +77,191 @@ app.post('/webhooks/whatsapp', async (req, res) => {
   }
 });
 
-/* -------------------- Shopify: Orders Create ----------------------- */
+// ---------- helpers ----------
+function verifyShopifyHmac(req) {
+  const h = req.get('X-Shopify-Hmac-Sha256') || '';
+  const d = crypto
+    .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET || '')
+    .update(req.body)
+    .digest('base64');
+  try { return crypto.timingSafeEqual(Buffer.from(d), Buffer.from(h)); }
+  catch { return false; }
+}
 
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const d = String(raw).replace(/\D/g, '');
+  if (d.length === 10) return `${DEFAULT_COUNTRY_CODE}${d}`;
+  if (d.startsWith('0') && d.length === 11) return `${DEFAULT_COUNTRY_CODE}${d.slice(1)}`;
+  return d;
+}
+
+async function waSend({ to, template, bodyParams, headerImageUrl }) {
+  const url = `https://graph.facebook.com/${WA_GRAPH_VERSION}/${WA_PHONE_ID}/messages`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'template',
+    template: { name: template, language: { code: WA_TEMPLATE_LANG } }
+  };
+
+  const components = [];
+
+  if (Array.isArray(bodyParams) && bodyParams.length) {
+    components.push({ type: 'body', parameters: bodyParams.map(t => ({ type: 'text', text: String(t) })) });
+  }
+
+  if (headerImageUrl) {
+    components.push({ type: 'header', parameters: [{ type: 'image', image: { link: headerImageUrl } }] });
+  }
+
+  if (components.length) payload.template.components = components;
+
+  console.log('[WA SEND]', JSON.stringify({ to, template, components: payload.template.components || undefined }, null, 2));
+
+  return axios.post(url, payload, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
+}
+
+async function waSendWithFallback({ to, template, bodyParams, headerImageUrl }) {
+  try {
+    return await waSend({ to, template, bodyParams, headerImageUrl });
+  } catch (e) {
+    const data = e?.response?.data;
+    console.error(`[WA SEND ERROR - ${template}]`, { error: data || e });
+    try {
+      console.log('[WA SEND]', JSON.stringify({ to, template: FALLBACK_TEMPLATE }, null, 2));
+      return await waSend({ to, template: FALLBACK_TEMPLATE });
+    } catch (e2) {
+      console.error('[WA SEND FALLBACK ERROR]', { error: e2?.response?.data || e2 });
+      throw e;
+    }
+  }
+}
+
+// Heuristic to detect COD from the Shopify order payload
+function isCOD(order) {
+  const gateways = (order?.payment_gateway_names || []).map(s => String(s).toLowerCase()).join(' ');
+  const gateway  = String(order?.gateway || '').toLowerCase();
+  const tags     = String(order?.tags || '').toLowerCase();
+  const fin      = String(order?.financial_status || '').toLowerCase();
+
+  const hit =
+    gateways.includes('cod') ||
+    gateways.includes('cash') ||
+    gateway.includes('cod') ||
+    gateway.includes('cash') ||
+    tags.includes('cod') ||
+    tags.includes('cash on delivery') ||
+    (fin === 'pending' && (gateways || gateway));
+
+  return !!hit;
+}
+
+// Build COD params in the exact order requested by COD_PARAM_ORDER
+function buildCodParams({ name, orderId, brand, total, items }) {
+  const map = {
+    NAME: name,
+    ORDER: orderId,
+    BRAND: brand,
+    TOTAL: total,
+    ITEMS: items
+  };
+  return String(COD_PARAM_ORDER)
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(k => map[k] != null)
+    .map(k => map[k]);
+}
+
+// ---------- Shopify: orders create ----------
 app.post('/webhooks/shopify/orders-create', async (req, res) => {
   if (!verifyShopifyHmac(req)) return res.status(401).send('Unauthorized');
-  if (!store.ready) return res.status(503).send('DB not ready');
 
   const o = JSON.parse(req.body.toString('utf8'));
 
-  const to = normalizePhone(o.phone || o.customer?.phone || o.shipping_address?.phone);
-  if (!to) return res.send('No phone');
+  const phone = normalizePhone(o.phone || o.customer?.phone || o.shipping_address?.phone);
+  if (!phone) return res.send('No phone');
 
   const name    = o?.shipping_address?.name || o?.customer?.first_name || 'there';
   const orderId = o.name || String(o.id);
   const total   = `₹${(Number(o.total_price) || 0).toFixed(2)}`;
-  const items   = (o.line_items || [])
-    .map(li => `${li.title} x${li.quantity}`)
-    .join(', ')
-    .slice(0, 900);
+  const items   = (o.line_items || []).map(li => `${li.title} x${li.quantity}`).join(', ').slice(0, 900);
 
-  // persist order
-  await store.addOrder({
-    id: o.id,
-    orderId,
-    phone: to,
+  // Persist (best-effort)
+  await store.addOrder({ id: o.id, orderId, phone, name, total, items, status: 'pending' });
+
+  const cod = isCOD(o);
+  const templateToUse = cod ? COD_TEMPLATE : ORDER_CONFIRMATION_TEMPLATE;
+
+  // PREPAID template expects: name, orderId, BRAND, total, items
+  const prepaidParams = [name, orderId, BRAND_NAME, total, items];
+
+  // COD template params built from env order
+  const codParams = buildCodParams({
     name,
+    orderId,
+    brand: BRAND_NAME,
     total,
-    items,
-    status: isCOD(o) ? 'cod_pending' : 'prepaid'
+    items
   });
 
-  // Decide template & parameter order
-  let templateName, components;
-
-  if (isCOD(o)) {
-    // Your new combined COD template: 5 params
-    // 1: Customer name, 2: Brand name, 3: Order ID, 4: Total, 5: Items list
-    templateName = COD_CONFIRM_TEMPLATE;
-    components = [{
-      type: 'body',
-      parameters: [
-        { type: 'text', text: name },
-        { type: 'text', text: BRAND_NAME },
-        { type: 'text', text: orderId },
-        { type: 'text', text: total },
-        { type: 'text', text: items }
-      ]
-    }];
-  } else {
-    // Prepaid: keep your 5-param order_confirmation
-    // 1: Customer name, 2: Order ID, 3: Brand name, 4: Total, 5: Items list
-    templateName = ORDER_CONFIRMATION_TEMPLATE;
-    components = [{
-      type: 'body',
-      parameters: [
-        { type: 'text', text: name },
-        { type: 'text', text: orderId },
-        { type: 'text', text: BRAND_NAME },
-        { type: 'text', text: total },
-        { type: 'text', text: items }
-      ]
-    }];
-  }
-
-  // Fire WhatsApp
-  const result = await sendTemplate({ to, template: templateName, components });
-
-  // Non-blocking: we already stored the order
-  if (!result.ok) {
-    console.error('Failed to send WA template:', result.error);
+  try {
+    await waSendWithFallback({
+      to: phone,
+      template: templateToUse,
+      bodyParams: cod ? codParams : prepaidParams
+    });
+  } catch (_) {
+    // errors already logged
   }
 
   res.send('ok');
 });
 
-/* ---------------------------- Start ------------------------------- */
+// ---------- admin broadcast ----------
+// GET /admin/broadcast?key=...&template=...&to=...&p1=..&p2=..&img=https://...
+app.get('/admin/broadcast', async (req, res) => {
+  try {
+    const { key, template, to, dry, img, ...rest } = req.query;
+    if (key !== 'covermeup123') return res.status(403).json({ ok: false, error: 'bad key' });
 
-app.listen(PORT, () =>
-  console.log(`Notifier (combined COD) listening on :${PORT}`)
-);
+    const phones = (to ? String(to).split(',') : []).map(normalizePhone).filter(Boolean);
+    const parametersPreview = Object.keys(rest)
+      .filter(k => /^p\d+$/i.test(k))
+      .sort((a,b) => Number(a.slice(1)) - Number(b.slice(1)))
+      .map(k => String(rest[k]));
+
+    if (dry === '1') {
+      return res.json({
+        ok: true,
+        dry: true,
+        template,
+        parametersPreview,
+        audienceCount: phones.length,
+        sample: phones.slice(0, 10)
+      });
+    }
+
+    const results = [];
+    for (const ph of phones) {
+      try {
+        await waSendWithFallback({
+          to: ph,
+          template,
+          bodyParams: parametersPreview,
+          headerImageUrl: img
+        });
+        results.push({ to: ph, ok: true });
+      } catch (e) {
+        results.push({ to: ph, ok: false, error: e?.response?.data || e?.message || String(e) });
+      }
+    }
+
+    res.json({ ok: true, template, sent: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, total: results.length, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.listen(PORT, () => console.log(`Notifier v5.7.2 listening on :${PORT}`));
